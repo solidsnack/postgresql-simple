@@ -111,6 +111,7 @@ module Database.PostgreSQL.Simple
     , beginMode
     , commit
     , rollback
+    , retry
     -- * Helper functions
     , formatMany
     , formatQuery
@@ -121,15 +122,17 @@ import           Blaze.ByteString.Builder
 import           Blaze.ByteString.Builder.Char8 (fromChar)
 import           Control.Applicative ((<$>), pure)
 import           Control.Concurrent.MVar
+import           Control.Concurrent (threadDelay)
 import           Control.Exception
-                   ( Exception, onException, throw, throwIO, finally )
-import           Control.Monad (foldM)
+                   ( Exception, onException, throw, throwIO, finally, tryJust )
+import           Control.Monad (foldM, guard)
 import           Data.ByteString (ByteString)
 import           Data.Int (Int64)
 import qualified Data.IntMap as IntMap
 import           Data.List (intersperse)
 import           Data.Monoid (mappend, mconcat)
 import           Data.Typeable (Typeable)
+import           System.Random (randomRIO)
 import           Database.PostgreSQL.Simple.BuiltinTypes ( oid2typname )
 import           Database.PostgreSQL.Simple.Compat ( mask )
 import           Database.PostgreSQL.Simple.FromField (ResultError(..))
@@ -699,6 +702,19 @@ fmtError msg q xs = throw FormatError {
         twiddle (Escape s)      = s
         twiddle (EscapeByteA s) = s
         twiddle (Many ys)       = B.concat (map twiddle ys)
+
+-- | Retry a Postgres transaction if it fails with SQL state @40001@,
+--   @SERIALIZATION_FAILURE@. The retry occurs randomly in an interval that
+--   increases exponentially with the number of retries. The first time, it
+--   waits up to @millis@; the second time, up to @2 * millis@, the third,
+--   @4 * millis@, and so on.
+retry :: Int -> Int -> IO t -> IO t
+retry millis times act = retry' 0
+  where txn e@SqlError{..}   = guard (sqlState == "40001") >> Just e
+        retry' n | n < times = either (const again) return =<< tryJust txn act
+                 | otherwise = act
+          where again = (threadDelay =<< t) >> retry' (n+1)
+                t     = randomRIO (0, abs millis * 2^n)
 
 -- $use
 --
